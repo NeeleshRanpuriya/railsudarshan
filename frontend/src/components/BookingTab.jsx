@@ -200,7 +200,7 @@ export default function BookingTab({
   const grandTotal = totalReservedFare + reservationFee + superfastCharge + gstTax;
 
   // Confirm and Pay -> Run Women Safety Seat Allocator
-  const handleConfirmAndPay = () => {
+  const handleConfirmAndPay = async () => {
     if (selectedTrain && isTrainDeparted(journeyDate, selectedTrain.departureTime)) {
       alert('Cannot book tickets for a train that has already departed!');
       setShowFareSummary(false);
@@ -246,13 +246,21 @@ export default function BookingTab({
       totalFare: grandTotal,
       bookingDate: new Date().toISOString(),
       status: 'Confirmed',
+      bookingStage: 'Confirmed',
+      paymentStatus: 'Demo payment recorded',
+      providerBookingStatus: 'Not submitted to IRCTC',
       allocationRationale: allocation.allocationRationale,
       isFemaleOnlyBooking: allocation.isFemaleOnlyBooking,
       stops: selectedTrain.stops,
     };
 
-    setBookedTicketResult(newTicket);
-    onTicketBooked(newTicket);
+    try {
+      const savedTicket = await onTicketBooked(newTicket);
+      setBookedTicketResult(savedTicket || newTicket);
+    } catch (error) {
+      alert(`Booking could not be saved: ${error.message}`);
+      return;
+    }
     setShowFareSummary(false);
   };
 
@@ -295,7 +303,7 @@ export default function BookingTab({
   };
 
   // Handle Unreserved (UTS) Booking
-  const handleBookUTS = (e) => {
+  const handleBookUTS = async (e) => {
     e.preventDefault();
     const distanceKm = 440;
     const ratePerKm = utsTrainType === 'Superfast' ? 0.45 : utsTrainType === 'Mail/Express' ? 0.38 : 0.25;
@@ -318,12 +326,16 @@ export default function BookingTab({
       qrCode: `UTS|${utsFrom}|${utsTo}|${utsAdults}A${utsChildren}C|₹${totalFare}`,
     };
 
-    setUtsBookedTicket(utsTicket);
-    onTicketBooked(utsTicket);
+    try {
+      const savedTicket = await onTicketBooked(utsTicket);
+      setUtsBookedTicket(savedTicket || utsTicket);
+    } catch (error) {
+      alert(`Ticket could not be saved: ${error.message}`);
+    }
   };
 
   // Handle Platform Ticket Booking
-  const handleBookPlatform = (e) => {
+  const handleBookPlatform = async (e) => {
     e.preventDefault();
     const cost = platformPersons * 10;
     const expiryTime = new Date(Date.now() + 2 * 60 * 60 * 1000);
@@ -340,8 +352,12 @@ export default function BookingTab({
       qrCode: `PLATFORM|${platformStation}|${platformPersons}P|VALID_2HR`,
     };
 
-    setPlatformTicketPass(platformTicket);
-    onTicketBooked(platformTicket);
+    try {
+      const savedTicket = await onTicketBooked(platformTicket);
+      setPlatformTicketPass(savedTicket || platformTicket);
+    } catch (error) {
+      alert(`Ticket could not be saved: ${error.message}`);
+    }
   };
 
   return (

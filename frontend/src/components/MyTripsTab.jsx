@@ -20,6 +20,7 @@ import CoachVisualizer from './CoachVisualizer';
 import { printTicket } from '../utils/printTicket';
 
 export default function MyTripsTab({ 
+  user,
   tickets = [], 
   onCancelTicket, 
   onSelectJourney, 
@@ -459,6 +460,7 @@ export default function MyTripsTab({
             <CoachVisualizer
               coachName={activeCoachMapTicket.coach}
               bookedSeats={activeCoachMapTicket.allocatedSeats || []}
+              showPassengerNames={false}
               allocationRationale={activeCoachMapTicket.allocationRationale}
               isFemaleOnly={activeCoachMapTicket.isFemaleOnlyBooking}
               isCancelled={activeCoachMapTicket.status === 'Cancelled'}

@@ -254,9 +254,10 @@ export const STATION_RESTAURANTS = {
 };
 
 export const ONBOARD_DOCTORS = [
-  { id: 'doc_1', name: 'Dr. Priya Sharma (MD, Cardiology)', coach: 'B2', berth: 24, mobile: '+91 98112 45890', isVerified: true },
-  { id: 'doc_2', name: 'Dr. Anand Verma (General Physician)', coach: 'A1', berth: 11, mobile: '+91 94331 87210', isVerified: true },
-  { id: 'doc_3', name: 'Nurse Sunita K. (Emergency Trauma Certified)', coach: 'B4', berth: 42, mobile: '+91 88762 33419', isVerified: true },
+  { id: 'doc_1', name: 'Dr. Priya Sharma (MD, Cardiology)', profession: 'Doctor', coach: 'B2', berth: 24, mobile: '+91 98112 45890', isVerified: true, trainNumber: '11058', travelDate: '2026-11-05', boardingStation: 'AGC', alightingStation: 'GWL' },
+  { id: 'doc_2', name: 'Dr. Anand Verma (General Physician)', profession: 'Doctor', coach: 'A1', berth: 11, mobile: '+91 94331 87210', isVerified: true, trainNumber: '11057', travelDate: '2026-11-05', boardingStation: 'BPL', alightingStation: 'GWL' },
+  { id: 'doc_3', name: 'Nurse Sunita K. (Emergency Trauma Certified)', profession: 'Nurse', coach: 'B4', berth: 42, mobile: '+91 88762 33419', isVerified: true, trainNumber: '11058', travelDate: '2026-11-05', boardingStation: 'GWL', alightingStation: 'NDLS' },
+  { id: 'doc_4', name: 'Dr. Amit Sharma (Emergency Medicine)', profession: 'Doctor', coach: 'A2', berth: 18, mobile: '+91 90000 11223', isVerified: true, trainNumber: '11057', travelDate: '2026-11-05', boardingStation: 'NGP', alightingStation: 'NDLS' },
 ];
 
 export const EMERGENCY_NUMBERS = [

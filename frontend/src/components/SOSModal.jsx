@@ -16,10 +16,16 @@ import {
 } from 'lucide-react';
 import { ONBOARD_DOCTORS, EMERGENCY_NUMBERS } from '../data/mockData';
 
+const KNOWN_ROUTE_ORDER = {
+  '11057': ['CSMT', 'KYN', 'NGP', 'BPL', 'GWL', 'AGC', 'NDLS'],
+  '11058': ['ASR', 'GWL', 'AGC', 'BPL', 'NGP', 'KYN', 'CSMT'],
+};
+
 export default function SOSModal({ 
   isOpen, 
   onClose, 
   user,
+  journey,
   trainStatus = { isCurrentlyRunning: true, currentStation: 'DDU' },
   stops = [
     { code: 'HWH', name: 'Howrah Jn', status: 'passed' },
@@ -48,6 +54,46 @@ export default function SOSModal({
   const [policeAlertStatus, setPoliceAlertStatus] = useState(null);
   const [threatDescription, setThreatDescription] = useState('Harassment / Suspicious Activity');
 
+  const journeyStops = Array.isArray(journey?.stops) ? journey.stops : [];
+  const routeOrder = KNOWN_ROUTE_ORDER[String(journey?.trainNumber)] || [];
+  const stopIndex = (code) => {
+    const normalizedCode = String(code || '').toUpperCase();
+    const knownIndex = routeOrder.indexOf(normalizedCode);
+    if (knownIndex >= 0) return knownIndex;
+    const journeyIndex = journeyStops.findIndex(
+      (stop) => String(stop.code || '').toUpperCase() === normalizedCode
+    );
+    return journeyIndex >= 0 ? routeOrder.length + journeyIndex : -1;
+  };
+  const passengerBoardingIndex = stopIndex(journey?.from);
+  const passengerAlightingIndex = stopIndex(journey?.to);
+  const currentStop = journeyStops.find((stop) => stop.status === 'current');
+  const currentStopIndex = currentStop
+    ? stopIndex(currentStop.code)
+    : -1;
+  const emergencyPositionIndex = currentStopIndex >= 0
+    ? currentStopIndex
+    : passengerBoardingIndex;
+  const matchingDoctors = ONBOARD_DOCTORS.filter((doctor) => {
+    if (!journey || !doctor.isVerified) return false;
+    if (String(doctor.trainNumber) !== String(journey.trainNumber)) return false;
+    if (doctor.travelDate !== journey.journeyDate) return false;
+    const doctorBoardingIndex = stopIndex(doctor.boardingStation);
+    const doctorAlightingIndex = stopIndex(doctor.alightingStation);
+    if (
+      passengerBoardingIndex < 0
+      || passengerAlightingIndex < 0
+      || emergencyPositionIndex < passengerBoardingIndex
+      || emergencyPositionIndex >= passengerAlightingIndex
+    ) return false;
+    return doctorBoardingIndex >= 0
+      && doctorAlightingIndex >= doctorBoardingIndex
+      && doctorBoardingIndex <= emergencyPositionIndex
+      && doctorAlightingIndex > emergencyPositionIndex
+      && doctorBoardingIndex < passengerAlightingIndex
+      && doctorAlightingIndex > passengerBoardingIndex;
+  });
+
   // Filter ONLY UPCOMING STATIONS for ambulance booking
   // Prompt Requirement: "(only , not on the station left, and can only be booked while the trian is running currnnently can't be booked in advance)."
   const upcomingStops = stops.filter(s => s.status === 'upcoming');
@@ -55,9 +101,11 @@ export default function SOSModal({
   // Handle Alert Doctor On Board
   const handleAlertDoctor = () => {
     setDoctorAlertStatus({
-      alertedDoctors: ONBOARD_DOCTORS,
+      alertedDoctors: matchingDoctors,
       timestamp: new Date().toLocaleTimeString(),
-      status: 'Emergency broadcast transmitted to 3 verified medical professionals on board in coaches B2, A1, B4.',
+      status: matchingDoctors.length
+        ? `Emergency broadcast transmitted to ${matchingDoctors.length} verified medical professional(s) currently overlapping your route segment.`
+        : 'No verified medical professional matched this train, date, and route segment. Railway emergency services have still been notified.',
     });
   };
 
@@ -198,7 +246,7 @@ export default function SOSModal({
                     </h4>
                   </div>
                   <span className="px-2.5 py-0.5 rounded-full text-[10px] font-bold bg-emerald-100 text-emerald-800 dark:bg-emerald-950 dark:text-emerald-300">
-                    3 Doctors in Train Database
+                    {matchingDoctors.length} Matched Medical Helper{matchingDoctors.length === 1 ? '' : 's'}
                   </span>
                 </div>
                 <p className="text-xs text-slate-500 dark:text-slate-400">
@@ -223,9 +271,18 @@ export default function SOSModal({
                     <p className="text-[11px] leading-relaxed">
                       {doctorAlertStatus.status}
                     </p>
-                    <div className="pt-1 text-[11px] font-mono border-t border-emerald-200 dark:border-emerald-800">
-                      Attending: Dr. Priya Sharma (Cardiology, Coach B2 Berth 24), Dr. Anand Verma (A1 Berth 11)
-                    </div>
+                    {matchingDoctors.length > 0 && (
+                      <div className="pt-1 text-[11px] font-mono border-t border-emerald-200 dark:border-emerald-800 space-y-1">
+                        {matchingDoctors.map((doctor) => (
+                          <div key={doctor.id}>
+                            {doctor.name} • {doctor.profession} • Coach {doctor.coach}, Berth {doctor.berth}
+                            <span className="block text-[10px] opacity-75">
+                              {doctor.trainNumber} • {doctor.travelDate} • {doctor.boardingStation} to {doctor.alightingStation}
+                            </span>
+                          </div>
+                        ))}
+                      </div>
+                    )}
                   </div>
                 )}
               </div>

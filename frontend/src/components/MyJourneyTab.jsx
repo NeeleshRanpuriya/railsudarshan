@@ -28,6 +28,8 @@ import { calculateRailwayRefund, CANCELLATION_SLABS } from '../utils/railwayFare
 import CoachVisualizer from './CoachVisualizer';
 import { printTicket } from '../utils/printTicket';
 
+const API_BASE = (import.meta.env.VITE_API_BASE_URL || '').replace(/\/+$/, '');
+
 function formatJourneyDate(value) {
   if (!value) return 'Date unavailable';
   const date = new Date(`${value}T00:00:00`);
@@ -50,6 +52,45 @@ function getEffectiveRunDate(ticket) {
 
   date.setDate(date.getDate() - offset);
   return date.toISOString().slice(0, 10);
+}
+
+function normalizeStationName(value) {
+  return String(value || '')
+    .toLowerCase()
+    .replace(/junction|jn\.?|central|railway station/g, '')
+    .replace(/[^a-z0-9]/g, '');
+}
+
+function getMinutesFromTime(value) {
+  const match = String(value || '').match(/^(\d{1,2}):(\d{2})$/);
+  return match ? Number(match[1]) * 60 + Number(match[2]) : null;
+}
+
+function hasScheduledHalt(stop) {
+  const arrival = getMinutesFromTime(stop.arrives);
+  const departure = getMinutesFromTime(stop.departs);
+  if (arrival === null || departure === null || arrival === departure) return false;
+  return (departure - arrival + 1440) % 1440 > 0;
+}
+
+function mergeLiveStops(previousStops, nextStops) {
+  if (!Array.isArray(nextStops) || !nextStops.length) return previousStops || [];
+  if (!Array.isArray(previousStops) || !previousStops.length) return nextStops;
+
+  const nextByName = new Map(
+    nextStops.map((stop) => [normalizeStationName(stop.stationName || stop.name), stop])
+  );
+
+  return previousStops.map((previousStop) => {
+    const key = normalizeStationName(previousStop.stationName || previousStop.name);
+    const nextStop = nextByName.get(key);
+    return nextStop ? { ...previousStop, ...nextStop } : previousStop;
+  });
+}
+
+function previousStatusBelongsToTicket(trainNumber, status) {
+  return !status?.trainNumber ||
+    String(status.trainNumber) === String(trainNumber);
 }
 
 export default function MyJourneyTab({ 
@@ -107,25 +148,51 @@ export default function MyJourneyTab({
   const activeTicket = tickets.find(t => (t.pnr && t.pnr === selectedPnr) || (t.id && t.id === selectedPnr)) || tickets[0] || defaultFallbackTicket;
   const effectiveRunDate = getEffectiveRunDate(activeTicket);
   const isCancelled = activeTicket.status === 'Cancelled';
-  const [liveStatus, setLiveStatus] = useState(null);
+  const [liveStatus, setLiveStatus] = useState({ loading: true });
   const [isLoadingLiveStatus, setIsLoadingLiveStatus] = useState(false);
+
+  useEffect(() => {
+    const requestedPnr = selectedJourneyPnr || tickets[0]?.pnr || tickets[0]?.id;
+    if (requestedPnr && requestedPnr !== selectedPnr) {
+      setSelectedPnr(requestedPnr);
+    }
+  }, [selectedJourneyPnr, tickets, selectedPnr]);
   const displayStops = useMemo(() => {
+    const statusBelongsToTicket = previousStatusBelongsToTicket(
+      activeTicket.trainNumber,
+      liveStatus
+    );
     const providerStops = Array.isArray(liveStatus?.stops) ? liveStatus.stops : [];
 
-    if (!providerStops.length) return activeTicket.stops || [];
+    if (!statusBelongsToTicket || !providerStops.length) return [];
 
-    const currentIndex = providerStops.findIndex((stop) =>
-      ['current', 'departed'].includes(String(stop.status || '').toLowerCase())
+    const boardingStation = STATIONS.find((station) => station.code === activeTicket.from);
+    const boardingNames = [
+      normalizeStationName(activeTicket.from),
+      normalizeStationName(boardingStation?.name),
+    ].filter(Boolean);
+    const boardingIndex = providerStops.findIndex((stop) =>
+      boardingNames.some((name) =>
+        normalizeStationName(stop.stationName) === name ||
+        normalizeStationName(stop.stationName).includes(name)
+      )
     );
-    const startIndex = currentIndex > 0 ? currentIndex - 1 : 0;
+    const startIndex = boardingIndex >= 0 ? boardingIndex : 0;
     const destination = STATIONS.find((station) => station.code === activeTicket.to);
     const destinationIndex = providerStops.findIndex((stop) => {
       const name = String(stop.stationName || '').toLowerCase();
       return name.includes(String(destination?.name || activeTicket.to).toLowerCase().split(' ')[0]);
     });
     const endIndex = destinationIndex >= startIndex ? destinationIndex : providerStops.length - 1;
+    const scheduledStopNames = new Set(
+      (activeTicket.stops || []).flatMap((stop) => [
+        normalizeStationName(stop.code),
+        normalizeStationName(stop.name),
+      ]).filter(Boolean)
+    );
 
-    return providerStops.slice(startIndex, endIndex + 1).map((stop, index) => ({
+    return providerStops.slice(startIndex, endIndex + 1)
+      .map((stop, index) => ({
       code: stop.stationName || `provider-stop-${index}`,
       name: stop.stationName,
       arrival: stop.arrives || '—',
@@ -133,32 +200,111 @@ export default function MyJourneyTab({
       status: stop.status || 'upcoming',
       delayStr: stop.delayStr,
       date: stop.date,
+      distance: Number(
+        stop.distance ?? stop.distanceKm ?? stop.dist ?? stop.km ?? NaN
+      ),
+      isScheduledStop: Boolean(
+        stop.isHalt ||
+        stop.isScheduledStop ||
+        stop.stoppage ||
+        stop.halt ||
+        scheduledStopNames.has(normalizeStationName(stop.stationName)) ||
+        hasScheduledHalt(stop)
+      ),
     }));
   }, [activeTicket.stops, activeTicket.to, liveStatus]);
+
+  const liveLocationInfo = useMemo(() => {
+    const location = liveStatus?.currentLocation ||
+      liveStatus?.currentStation ||
+      liveStatus?.current_station;
+    if (!location || !displayStops.length) return null;
+
+    const locationName = normalizeStationName(location);
+    const matchingStop = displayStops.find(
+      (stop) => normalizeStationName(stop.name) === locationName
+    );
+    if (matchingStop) {
+      return {
+        name: location,
+        between: false,
+        passingThrough: matchingStop.isScheduledStop === false,
+      };
+    }
+
+    const currentIndex = displayStops.reduce((lastIndex, stop, index) =>
+      ['current', 'departed'].includes(String(stop.status || '').toLowerCase())
+        ? index
+        : lastIndex, -1);
+    const previousStop = currentIndex >= 0 ? displayStops[currentIndex] : null;
+    const nextStop = currentIndex >= 0 ? displayStops[currentIndex + 1] : null;
+
+    return {
+      name: location,
+      between: Boolean(previousStop && nextStop),
+      previousStop,
+      nextStop,
+    };
+  }, [displayStops, liveStatus]);
 
   const fetchLiveStatus = async () => {
     if (!activeTicket.trainNumber || isCancelled) return;
     setIsLoadingLiveStatus(true);
+    setLiveStatus((previousStatus) => previousStatus
+      ? { ...previousStatus, refreshing: true }
+      : { loading: true });
     try {
       const date = String(activeTicket.journeyDate || activeTicket.runDate || '');
       const params = new URLSearchParams({
         date,
         from: String(activeTicket.from || ''),
+        runDate: String(effectiveRunDate || ''),
         refresh: '1',
         _: String(Date.now()),
       });
-      const response = await fetch(`/api/railway/live/${encodeURIComponent(activeTicket.trainNumber)}?${params.toString()}`, {
+      const response = await fetch(`${API_BASE}/api/railway/live/${encodeURIComponent(activeTicket.trainNumber)}?${params.toString()}`, {
         cache: 'no-store',
       });
-      const result = await response.json();
-      if (!response.ok) throw new Error(result.message || 'Live status unavailable');
-      setLiveStatus({
-        ...(result.data || result),
+      const contentType = response.headers.get('content-type') || '';
+      const responseText = await response.text();
+      let result = null;
+      if (contentType.includes('application/json')) {
+        try {
+          result = JSON.parse(responseText);
+        } catch {
+          throw new Error('Live status returned invalid JSON');
+        }
+      } else {
+        throw new Error(
+          response.ok
+            ? 'Live status endpoint returned HTML instead of JSON. Check VITE_API_BASE_URL.'
+            : `Live status request failed with HTTP ${response.status}. Check the deployed backend URL.`
+        );
+      }
+      if (!response.ok) throw new Error(result?.message || 'Live status unavailable');
+      const nextStatus = result.data || result;
+      setLiveStatus((previousStatus) => ({
+        ...(previousStatus || {}),
+        ...nextStatus,
+        stops: mergeLiveStops(
+          previousStatusBelongsToTicket(activeTicket.trainNumber, previousStatus)
+            ? previousStatus?.stops
+            : [],
+          nextStatus.stops
+        ),
+        trainNumber: activeTicket.trainNumber,
+        loading: false,
+        refreshing: false,
         runDate: result.runDate,
         boardingDate: result.boardingDate,
-      });
+      }));
     } catch (error) {
-      setLiveStatus({ error: error.message });
+      setLiveStatus((previousStatus) => ({
+        ...(previousStatus || {}),
+        loading: false,
+        refreshing: false,
+        error: error.message,
+      }));
     } finally {
       setIsLoadingLiveStatus(false);
     }
@@ -166,7 +312,7 @@ export default function MyJourneyTab({
 
   useEffect(() => {
     fetchLiveStatus();
-  }, [activeTicket.trainNumber, activeTicket.runDate, activeTicket.journeyDate, isCancelled]);
+  }, [activeTicket.pnr, activeTicket.trainNumber, activeTicket.from, activeTicket.runDate, activeTicket.journeyDate, isCancelled]);
 
   // --- SERVICE 1: FOOD ORDERS STATE ---
   const [foodStation, setFoodStation] = useState('CNB');
@@ -495,6 +641,8 @@ export default function MyJourneyTab({
               <div className="text-sm font-bold text-slate-900 dark:text-white mt-1">
                 {liveStatus?.error
                   ? liveStatus.error
+                  : liveStatus?.loading
+                    ? 'Fetching live train position...'
                   : [
                       liveStatus?.currentLocation || liveStatus?.currentStation || liveStatus?.current_station,
                       liveStatus?.locationStatus || liveStatus?.status,
@@ -503,6 +651,13 @@ export default function MyJourneyTab({
               {liveStatus?.lastUpdated && (
                 <div className="text-xs text-slate-500 mt-1">
                   Provider updated: {liveStatus.lastUpdated}
+                </div>
+              )}
+              {liveLocationInfo && (liveLocationInfo.between || liveLocationInfo.passingThrough) && (
+                <div className="text-xs text-amber-700 dark:text-amber-300 mt-1 font-semibold">
+                  {liveLocationInfo.passingThrough
+                    ? 'Train is passing through this location; no scheduled halt.'
+                    : `GPS location is between ${liveLocationInfo.previousStop.name} and ${liveLocationInfo.nextStop.name}; this is not a scheduled halt.`}
                 </div>
               )}
               {liveStatus?.eta && (
@@ -520,8 +675,13 @@ export default function MyJourneyTab({
             </button>
           </div>
 
-          <div className="overflow-x-auto pb-4">
-            <div className="flex items-center min-w-[760px] gap-2 p-2">
+          <div className="pb-4">
+            {liveStatus?.loading && !displayStops.length ? (
+              <div className="p-6 rounded-2xl bg-slate-50 dark:bg-slate-800/60 text-sm text-slate-500 dark:text-slate-400">
+                Loading the live route schedule...
+              </div>
+            ) : (
+            <div className="flex flex-col gap-0 p-2 max-w-3xl">
               {displayStops.map((stop, idx) => {
                 const hasNotStarted = ['yet to start', 'not started'].includes(
                   String(liveStatus?.locationStatus || '').toLowerCase()
@@ -536,62 +696,70 @@ export default function MyJourneyTab({
                   liveStatus?.current_station ||
                   ''
                 ).toLowerCase();
+                const liveLocationMatchesStop = displayStops.some((candidate) =>
+                  (candidate.name || '').toLowerCase().includes(liveLocation)
+                );
                 const stopMatchesLiveLocation = liveLocation &&
                   (stop.name || '').toLowerCase().includes(liveLocation);
                 const isPassed = liveStatusIsAuthoritative && hasNotStarted
                   ? false
                   : liveStatusFailed
                     ? false
-                  : liveStatusIsAuthoritative && liveLocation && !stopMatchesLiveLocation
+                  : liveStatusIsAuthoritative && liveLocationMatchesStop && !stopMatchesLiveLocation
                     ? false
                     : stop.status === 'passed';
                 const isCurrent = liveStatusIsAuthoritative && hasNotStarted
                   ? false
                   : liveStatusFailed
                     ? false
-                  : liveStatusIsAuthoritative && liveLocation && !stopMatchesLiveLocation
+                  : liveStatusIsAuthoritative && liveLocationMatchesStop && !stopMatchesLiveLocation
                     ? false
                     : stop.status === 'current';
                 const isUpcoming = !isPassed && !isCurrent;
 
                 return (
-                  <div key={stop.code} className="flex-1 flex flex-col items-center relative">
+                  <div key={stop.code} className="relative flex gap-4 min-h-[104px]">
                     {/* Connecting line */}
                     {idx < displayStops.length - 1 && (
-                      <div className={`absolute top-4 left-1/2 w-full h-1 z-0 ${
+                      <div className={`absolute top-8 left-[15px] w-1 h-[calc(100%-24px)] z-0 ${
                         isPassed ? 'bg-emerald-500' : isCurrent ? 'bg-amber-400' : 'bg-slate-200 dark:bg-slate-700'
                       }`} />
                     )}
 
                     {/* Node circle */}
-                    <div className={`w-8 h-8 rounded-full flex items-center justify-center text-xs font-bold relative z-10 shadow-sm transition-all ${
+                    <div className={`w-8 h-8 shrink-0 rounded-full flex items-center justify-center text-xs font-bold relative z-10 shadow-sm transition-all ${
                       isCurrent
-                        ? 'bg-amber-500 text-slate-900 ring-4 ring-amber-300 animate-pulse'
+                        ? 'bg-white text-blue-600 ring-4 ring-amber-300 animate-pulse'
                         : isPassed
                         ? 'bg-emerald-600 text-white'
                         : 'bg-white dark:bg-slate-800 border-2 border-slate-300 dark:border-slate-600 text-slate-400'
-                    }`}>
-                      {isPassed ? '✓' : idx + 1}
+                      }`}>
+                      {isCurrent ? <Train className="w-5 h-5" aria-label="Train is currently here" /> : isPassed ? '✓' : idx + 1}
                     </div>
 
-                    <div className="text-center mt-2 space-y-0.5">
-                      <div className="text-xs font-bold text-slate-900 dark:text-white">
+                    <div className="text-left -mt-1 space-y-1">
+                      <div className="text-sm font-bold text-slate-900 dark:text-white">
                         {stop.name}
                       </div>
-                      <div className="text-[10px] font-mono text-slate-500 dark:text-slate-400">
+                      <div className="text-xs font-mono text-slate-500 dark:text-slate-400">
                         Arr: <strong className="text-slate-700 dark:text-slate-300">{stop.arrival}</strong>
                       </div>
-                      <div className="text-[10px] font-mono text-slate-500 dark:text-slate-400">
+                      <div className="text-xs font-mono text-slate-500 dark:text-slate-400">
                         Dep: <strong className="text-slate-700 dark:text-slate-300">{stop.departure}</strong>
                       </div>
                       {stop.date && (
-                        <div className="text-[10px] text-slate-400">
+                        <div className="text-xs text-slate-400">
                           {stop.date}{stop.delayStr ? ` • ${stop.delayStr}` : ''}
                         </div>
                       )}
-                      {isCurrent && (
+                      {isCurrent && stop.isScheduledStop !== false && (
                         <span className="inline-block px-1.5 py-0.2 rounded text-[9px] font-bold bg-amber-400 text-slate-900">
                           AT STATION
+                        </span>
+                      )}
+                      {stop.isScheduledStop === false && (
+                        <span className="inline-block px-1.5 py-0.2 rounded text-[9px] font-bold bg-slate-200 text-slate-700 dark:bg-slate-700 dark:text-slate-200">
+                          PASSING THROUGH • NO HALT
                         </span>
                       )}
                     </div>
@@ -599,6 +767,7 @@ export default function MyJourneyTab({
                 );
               })}
             </div>
+            )}
           </div>
         </div>
 

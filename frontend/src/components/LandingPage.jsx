@@ -93,13 +93,6 @@ export default function LandingPage({
       return;
     }
 
-    // CHECK IF EXISTING USER (Prompt Requirement: "if existing user is trying to create a new account then raise and an error already exists.")
-    const existing = registeredUsers.find(u => u.mobile === cleanMobile);
-    if (existing) {
-      setErrorMsg('An account with this mobile number already exists! Please login instead.');
-      return;
-    }
-
     setPendingUser({
       fullName: regForm.fullName,
       age: ageNum,
@@ -115,7 +108,7 @@ export default function LandingPage({
   };
 
   // Handle PIN Setup Submit
-  const handlePinSubmit = (e) => {
+  const handlePinSubmit = async (e) => {
     e.preventDefault();
     setErrorMsg('');
 
@@ -134,46 +127,41 @@ export default function LandingPage({
       createdAt: new Date().toISOString(),
     };
 
-    onRegisterUser(completeUser);
-    setSuccessMsg('Account created successfully! Logging you in...');
-    setTimeout(() => {
-      onLoginSuccess(completeUser);
-    }, 800);
+    try {
+      const backendUser = await onRegisterUser(completeUser);
+      setSuccessMsg('Account created successfully! Logging you in...');
+      setTimeout(() => onLoginSuccess(backendUser || completeUser), 800);
+    } catch (error) {
+      setErrorMsg(error.message || 'Unable to create account.');
+    }
   };
 
   // Handle Login
-  const handleLoginSubmit = (e) => {
+  const handleLoginSubmit = async (e) => {
     e.preventDefault();
     setErrorMsg('');
 
     const cleanMobile = loginMobile.trim().replace(/\D/g, '');
-    if (!cleanMobile) {
-      setErrorMsg('Please enter your mobile number.');
+    if (cleanMobile.length !== 10) {
+      setErrorMsg('Please enter a valid 10-digit mobile number.');
       return;
     }
 
     const user = registeredUsers.find(u => u.mobile === cleanMobile);
-    if (!user) {
-      setErrorMsg('No user account found with this mobile number. Please sign up.');
-      return;
-    }
 
-    if (loginMethod === 'pin') {
-      if (user.pin !== loginPin) {
-        setErrorMsg('Invalid Security PIN. Please try again.');
+    try {
+      const backendUser = await onLoginSuccess({
+        ...(user || { mobile: cleanMobile }),
+        loginPassword: loginMethod === 'password' ? loginPassword : undefined,
+        loginPin: loginMethod === 'pin' ? loginPin : undefined,
+      });
+      setSuccessMsg('Login successful! Redirecting...');
+      if (backendUser || user) {
         return;
       }
-    } else {
-      if (user.password !== loginPassword) {
-        setErrorMsg('Invalid Password. Please try again.');
-        return;
-      }
+    } catch (error) {
+      setErrorMsg(error.message || 'Unable to login.');
     }
-
-    setSuccessMsg('Login successful! Redirecting...');
-    setTimeout(() => {
-      onLoginSuccess(user);
-    }, 500);
   };
 
   return (

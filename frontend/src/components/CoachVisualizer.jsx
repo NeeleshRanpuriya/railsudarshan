@@ -23,7 +23,25 @@ export default function CoachVisualizer({
 }) {
   const [selectedSeat, setSelectedSeat] = useState(null);
 
-  const berths = propBerths || generateCoachState(coachName, 64);
+  const generatedBerths = propBerths || generateCoachState(coachName, 64);
+  const berths = generatedBerths.map((seat) => {
+    const bookedSeat = bookedSeats.find(
+      (item) => item.berthNumber === seat.berthNumber
+    );
+    if (!bookedSeat) return seat;
+
+    return {
+      ...seat,
+      isOccupied: true,
+      isCurrentUserBooking: true,
+      occupant: {
+        ...seat.occupant,
+        name: bookedSeat.passengerName || seat.occupant?.name || 'Current passenger',
+        gender: bookedSeat.gender || seat.occupant?.gender,
+        berthType: bookedSeat.berthType || seat.berthType,
+      },
+    };
+  });
 
   // Group berths into 8-berth bays (Classic Indian Railways compartment layout)
   // Each bay has: 6 main berths (Lower, Middle, Upper x 2) + 2 side berths (Side Lower, Side Upper)

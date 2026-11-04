@@ -9,6 +9,16 @@ import NewsTab from './components/NewsTab';
 import MeProfileModal from './components/MeProfileModal';
 import SOSModal from './components/SOSModal';
 import RailwayApiConfigModal from './components/RailwayApiConfigModal';
+import {
+  cancelBooking,
+  clearAuthToken,
+  fetchBookings,
+  loginWithBackend,
+  registerWithBackend,
+  saveBooking,
+} from './services/authService';
+
+const hasConfiguredBackend = Boolean(import.meta.env.VITE_API_BASE_URL);
 
 // Initial pre-loaded registered users in our system database
 const INITIAL_USERS = [
@@ -72,49 +82,20 @@ export default function App() {
   const [isSOSOpen, setIsSOSOpen] = useState(false);
   const [isApiConfigOpen, setIsApiConfigOpen] = useState(false);
 
-  // Tickets state with localStorage persistence
+  // Tickets are loaded per authenticated user from MongoDB.
   const [tickets, setTickets] = useState(() => {
     const saved = localStorage.getItem('railraksha_tickets');
     if (saved) {
       try {
-        return JSON.parse(saved);
+        const parsed = JSON.parse(saved);
+        return Array.isArray(parsed)
+          ? parsed.filter((ticket) => ticket.backendBookingId)
+          : [];
       } catch (e) {
         console.error(e);
       }
     }
-    return [
-      {
-        pnr: '2489102431',
-        bookingType: 'Reserved',
-        trainNumber: '12301',
-        trainName: 'Howrah Rajdhani Express (via Gaya)',
-        from: 'HWH',
-        to: 'NDLS',
-        journeyDate: '2026-11-02',
-        travelClass: '3A',
-        coach: 'B3',
-        passengers: [
-          { id: 1, name: 'Ananya Deshmukh', age: 24, gender: 'female', berthNumber: 21, berthType: 'Lower' }
-        ],
-        allocatedSeats: [
-          { berthNumber: 21, bayNumber: 3, berthType: 'Lower', passengerName: 'Ananya Deshmukh', gender: 'female' }
-        ],
-        totalFare: 2365,
-        status: 'Confirmed',
-        allocationRationale: '🛡️ Women Safety Engine: Solo female allocated in Bay 3 alongside verified family (Berths 17-19) and fellow female traveler.',
-        isFemaleOnlyBooking: true,
-        stops: [
-          { code: 'HWH', name: 'Howrah Jn', arrival: 'Source', departure: '16:50', day: 1, dist: 0, status: 'passed' },
-          { code: 'ASN', name: 'Asansol Jn', arrival: '18:57', departure: '19:00', day: 1, dist: 200, status: 'passed' },
-          { code: 'DHN', name: 'Dhanbad Jn', arrival: '19:50', departure: '19:55', day: 1, dist: 259, status: 'passed' },
-          { code: 'GAYA', name: 'Gaya Jn', arrival: '22:19', departure: '22:22', day: 1, dist: 459, status: 'passed' },
-          { code: 'DDU', name: 'Pt. Deen Dayal Upadhyaya Jn', arrival: '00:45', departure: '00:55', day: 2, dist: 664, status: 'current' },
-          { code: 'PRYJ', name: 'Prayagraj Jn', arrival: '02:43', departure: '02:45', day: 2, dist: 816, status: 'upcoming' },
-          { code: 'CNB', name: 'Kanpur Central', arrival: '04:50', departure: '04:55', day: 2, dist: 1011, status: 'upcoming' },
-          { code: 'NDLS', name: 'New Delhi', arrival: '10:05', departure: 'Destination', day: 2, dist: 1451, status: 'upcoming' },
-        ]
-      }
-    ];
+    return [];
   });
 
   // Sync tickets with localStorage
@@ -142,38 +123,92 @@ export default function App() {
   useEffect(() => {
     if (currentUser) {
       localStorage.setItem('railraksha_current_user', JSON.stringify(currentUser));
+      setTickets([]);
+      fetchBookings()
+        .then((remoteTickets) => {
+          setTickets(remoteTickets);
+        })
+        .catch((error) => {
+          console.warn('Unable to load MongoDB bookings:', error.message);
+        });
     } else {
       localStorage.removeItem('railraksha_current_user');
+      setTickets([]);
     }
   }, [currentUser]);
 
   // Register user handler
-  const handleRegisterUser = (newUser) => {
+  const handleRegisterUser = async (newUser) => {
+    try {
+      const backendUser = await registerWithBackend(newUser);
+      setRegisteredUsers(prev => [...prev, backendUser]);
+      return backendUser;
+    } catch (error) {
+      if (hasConfiguredBackend) {
+        throw error;
+      }
+      console.warn('Backend registration unavailable; using local demo account:', error.message);
+    }
     setRegisteredUsers(prev => [...prev, newUser]);
+    return newUser;
   };
 
   // Login handler
-  const handleLoginSuccess = (user) => {
-    setCurrentUser(user);
+  const handleLoginSuccess = async (user) => {
+    if (user?.loginPassword || user?.loginPin) {
+      try {
+        const backendUser = await loginWithBackend({
+          mobile: user.mobile,
+          password: user.loginPassword,
+          pin: user.loginPin,
+        });
+        setCurrentUser(backendUser);
+        return backendUser;
+      } catch (error) {
+        if (hasConfiguredBackend) {
+          throw error;
+        }
+        console.warn('Backend login unavailable; using local demo account:', error.message);
+      }
+    }
+    const safeUser = { ...user };
+    delete safeUser.loginPassword;
+    delete safeUser.loginPin;
+    setCurrentUser(safeUser);
+    return safeUser;
   };
 
   // Logout handler
   const handleLogout = () => {
+    clearAuthToken();
     setCurrentUser(null);
   };
 
   // Add newly booked ticket
-  const handleTicketBooked = (newTicket) => {
-    setTickets(prev => [newTicket, ...prev]);
+  const handleTicketBooked = async (newTicket) => {
+    try {
+      const savedTicket = await saveBooking(newTicket);
+      setTickets(prev => [savedTicket, ...prev]);
+      return savedTicket;
+    } catch (error) {
+      console.error('Booking was not saved to MongoDB:', error);
+      throw error;
+    }
   };
 
   // Cancel ticket handler (updates ticket status to Cancelled and saves refund info)
-  const handleCancelTicket = (pnr, refundInfo) => {
+  const handleCancelTicket = async (pnr, refundInfo) => {
+    const ticket = tickets.find((item) => item.pnr === pnr || item.id === pnr);
+    if (ticket?.backendBookingId) {
+      await cancelBooking(ticket.backendBookingId, refundInfo);
+    }
     setTickets(prev => prev.map(t => {
       if (t.pnr === pnr || t.id === pnr) {
         return {
           ...t,
           status: 'Cancelled',
+          bookingStage: 'Refund Processed',
+          paymentStatus: 'Refund processed',
           refundInfo: refundInfo,
           cancelledAt: new Date().toISOString(),
         };
@@ -223,6 +258,7 @@ export default function App() {
 
             {currentTab === 'mytrips' && (
               <MyTripsTab
+                user={currentUser}
                 tickets={tickets}
                 onCancelTicket={handleCancelTicket}
                 onSelectJourney={(t) => {
@@ -285,6 +321,9 @@ export default function App() {
             isOpen={isSOSOpen}
             onClose={() => setIsSOSOpen(false)}
             user={currentUser}
+            journey={tickets.find((ticket) => (
+              ticket.pnr === selectedJourneyPnr || ticket.id === selectedJourneyPnr
+            )) || tickets.find((ticket) => ticket.status !== 'Cancelled')}
           />
 
           {/* Railway API Configuration & Key Settings Modal */}

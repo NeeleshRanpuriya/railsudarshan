@@ -1,6 +1,9 @@
 import dotenv from "dotenv";
 import express from "express";
 import cors from "cors";
+import bcrypt from "bcryptjs";
+import jwt from "jsonwebtoken";
+import mongoose from "mongoose";
 import { fileURLToPath } from "url";
 import { dirname, resolve } from "path";
 
@@ -18,8 +21,66 @@ dotenv.config({
 
 const app = express();
 
-app.use(cors());
+const allowedOrigins = (process.env.FRONTEND_ORIGIN || "")
+  .split(",")
+  .map((origin) => origin.trim())
+  .filter(Boolean);
+const localOrigins = [
+  "http://localhost:3000",
+  "http://127.0.0.1:3000",
+];
+
+app.use(cors({
+  origin(origin, callback) {
+    if (
+      !origin
+      || allowedOrigins.length === 0
+      || allowedOrigins.includes(origin)
+      || localOrigins.includes(origin)
+    ) {
+      return callback(null, true);
+    }
+
+    return callback(new Error("Origin is not allowed"));
+  },
+}));
 app.use(express.json({ limit: "1mb" }));
+
+app.use((req, res, next) => {
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("X-Frame-Options", "DENY");
+  res.setHeader("Referrer-Policy", "strict-origin-when-cross-origin");
+  next();
+});
+
+const requestCounts = new Map();
+const RATE_LIMIT_WINDOW_MS = 60_000;
+const RATE_LIMIT_MAX_REQUESTS = 120;
+
+app.use("/api/railway", (req, res, next) => {
+  const forwardedFor = req.headers["x-forwarded-for"];
+  const clientKey = String(forwardedFor || req.socket.remoteAddress || "unknown")
+    .split(",")[0]
+    .trim();
+  const now = Date.now();
+  const current = requestCounts.get(clientKey);
+
+  if (!current || now - current.startedAt >= RATE_LIMIT_WINDOW_MS) {
+    requestCounts.set(clientKey, { startedAt: now, count: 1 });
+    return next();
+  }
+
+  current.count += 1;
+  if (current.count > RATE_LIMIT_MAX_REQUESTS) {
+    res.setHeader("Retry-After", "60");
+    return res.status(429).json({
+      success: false,
+      message: "Too many requests. Please try again shortly.",
+    });
+  }
+
+  return next();
+});
 
 const PORT = process.env.PORT || 5000;
 const BASE_URL = (
@@ -27,7 +88,35 @@ const BASE_URL = (
 ).replace(/\/+$/, "");
 
 const API_KEY = process.env.IRCTC_API_KEY;
+const JWT_SECRET = process.env.JWT_SECRET;
+const MONGODB_URI = process.env.MONGODB_URI;
 const liveStatusCache = new Map();
+let mongoConnectionPromise;
+
+const userSchema = new mongoose.Schema(
+  {
+    fullName: { type: String, required: true, trim: true, maxlength: 100 },
+    mobile: { type: String, required: true, unique: true, index: true },
+    age: { type: Number, min: 1, max: 120 },
+    gender: { type: String, maxlength: 20 },
+    occupation: { type: String, maxlength: 80 },
+    passwordHash: { type: String, required: true },
+    pinHash: { type: String },
+  },
+  { timestamps: true }
+);
+
+const bookingSchema = new mongoose.Schema(
+  {
+    ownerId: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true, index: true },
+    booking: { type: mongoose.Schema.Types.Mixed, required: true },
+    status: { type: String, default: "Confirmed" },
+  },
+  { timestamps: true }
+);
+
+const User = mongoose.models.RailRakshaUser || mongoose.model("RailRakshaUser", userSchema);
+const Booking = mongoose.models.RailRakshaBooking || mongoose.model("RailRakshaBooking", bookingSchema);
 
 app.disable("x-powered-by");
 
@@ -74,7 +163,19 @@ async function railwayAPI(endpoint, params = {}) {
     }
 
     if (!response.ok) {
-      const error = new Error("Railway provider request failed");
+      const providerMessage = data?.message || data?.error || data?.detail;
+      const statusMessage = response.status === 401 || response.status === 403
+        ? "Railway provider rejected the API key. Check IRCTC_API_KEY in the deployed backend."
+        : response.status === 404
+          ? `Railway provider endpoint or train was not found (${endpoint}).`
+          : response.status === 429
+            ? "Railway provider rate limit reached. Please try again shortly."
+            : response.status >= 500
+              ? "Railway provider is temporarily unavailable."
+              : `Railway provider request failed with HTTP ${response.status}.`;
+      const error = new Error(providerMessage
+        ? `${statusMessage} Provider: ${String(providerMessage).slice(0, 180)}`
+        : statusMessage);
       error.status = response.status >= 500 ? 502 : response.status;
       throw error;
     }
@@ -204,6 +305,62 @@ function optionalShortText(value, name, maxLength = 100) {
   return result;
 }
 
+async function connectMongo() {
+  if (!MONGODB_URI) {
+    const error = new Error("MongoDB is not configured");
+    error.status = 503;
+    throw error;
+  }
+  if (!mongoConnectionPromise) {
+    mongoConnectionPromise = mongoose.connect(MONGODB_URI, {
+      serverSelectionTimeoutMS: 8000,
+      dbName: "railraksha",
+    }).catch((error) => {
+      mongoConnectionPromise = undefined;
+      throw error;
+    });
+  }
+  await mongoConnectionPromise;
+}
+
+function authSecret() {
+  if (!JWT_SECRET || JWT_SECRET.length < 32) {
+    const error = new Error("JWT_SECRET must be configured with at least 32 characters");
+    error.status = 503;
+    throw error;
+  }
+  return JWT_SECRET;
+}
+
+function signToken(user) {
+  return jwt.sign({ sub: String(user._id), mobile: user.mobile }, authSecret(), {
+    expiresIn: "7d",
+  });
+}
+
+async function authenticate(req, res, next) {
+  try {
+    const header = req.headers.authorization || "";
+    if (!header.startsWith("Bearer ")) {
+      const error = new Error("Bearer token is required");
+      error.status = 401;
+      throw error;
+    }
+    const payload = jwt.verify(header.slice(7), authSecret());
+    await connectMongo();
+    const user = await User.findById(payload.sub).select("-passwordHash -pinHash").lean();
+    if (!user) {
+      const error = new Error("User account not found");
+      error.status = 401;
+      throw error;
+    }
+    req.user = user;
+    next();
+  } catch (error) {
+    next(error.status ? error : Object.assign(new Error("Invalid or expired token"), { status: 401 }));
+  }
+}
+
 // ==========================================
 // 4. ASYNC ROUTE HANDLER
 // ==========================================
@@ -216,6 +373,15 @@ const route = (handler) => (req, res, next) => {
 // 5. BACKEND HEALTH
 // ==========================================
 
+app.get("/", (req, res) => {
+  res.json({
+    success: true,
+    service: "RailRaksha Backend",
+    message: "Backend is running",
+    health: "/api/health",
+  });
+});
+
 app.get("/api/health", (req, res) => {
   res.json({
     success: true,
@@ -224,6 +390,182 @@ app.get("/api/health", (req, res) => {
     timestamp: new Date().toISOString(),
   });
 });
+
+app.get("/api/health/db", route(async (req, res) => {
+  await connectMongo();
+  res.json({
+    success: true,
+    status: "CONNECTED",
+    database: mongoose.connection.name,
+    host: mongoose.connection.host,
+  });
+}));
+
+app.post("/api/auth/register", route(async (req, res) => {
+  const fullName = required(req.body.fullName, "Full name");
+  const mobile = required(req.body.mobile, "Mobile").replace(/\D/g, "");
+  const password = required(req.body.password, "Password");
+
+  if (!/^\d{10}$/.test(mobile)) {
+    const error = new Error("Mobile must contain 10 digits");
+    error.status = 400;
+    throw error;
+  }
+  if (password.length < 8) {
+    const error = new Error("Password must contain at least 8 characters");
+    error.status = 400;
+    throw error;
+  }
+
+  await connectMongo();
+  const existing = await User.findOne({ mobile }).lean();
+  if (existing) {
+    const error = new Error("An account with this mobile number already exists");
+    error.status = 409;
+    throw error;
+  }
+
+  const user = await User.create({
+    fullName,
+    mobile,
+    age: req.body.age,
+    gender: optionalShortText(req.body.gender, "Gender", 20),
+    occupation: optionalShortText(req.body.occupation, "Occupation", 80),
+    passwordHash: await bcrypt.hash(password, 12),
+    pinHash: req.body.pin ? await bcrypt.hash(String(req.body.pin), 12) : undefined,
+  });
+
+  res.status(201).json({
+    success: true,
+    token: signToken(user),
+    user: {
+      id: user._id,
+      fullName: user.fullName,
+      mobile: user.mobile,
+      age: user.age,
+      gender: user.gender,
+      occupation: user.occupation,
+    },
+  });
+}));
+
+app.post("/api/auth/login", route(async (req, res) => {
+  const mobile = required(req.body.mobile, "Mobile").replace(/\D/g, "");
+  const credential = required(req.body.password || req.body.pin, "Password or PIN");
+
+  await connectMongo();
+  const user = await User.findOne({ mobile });
+  if (!user) {
+    const error = new Error("Invalid mobile number or credentials");
+    error.status = 401;
+    throw error;
+  }
+
+  const hash = req.body.pin ? user.pinHash : user.passwordHash;
+  if (!hash || !(await bcrypt.compare(credential, hash))) {
+    const error = new Error("Invalid mobile number or credentials");
+    error.status = 401;
+    throw error;
+  }
+
+  res.json({
+    success: true,
+    token: signToken(user),
+    user: {
+      id: user._id,
+      fullName: user.fullName,
+      mobile: user.mobile,
+      age: user.age,
+      gender: user.gender,
+      occupation: user.occupation,
+    },
+  });
+}));
+
+app.get("/api/auth/me", authenticate, (req, res) => {
+  res.json({ success: true, user: req.user });
+});
+
+app.get("/api/bookings", authenticate, route(async (req, res) => {
+  await connectMongo();
+  const bookings = await Booking.find({ ownerId: req.user._id })
+    .sort({ createdAt: -1 })
+    .limit(100)
+    .lean();
+  res.json({ success: true, bookings });
+}));
+
+app.post("/api/bookings", authenticate, route(async (req, res) => {
+  const body = req.body && typeof req.body === "object" ? req.body : {};
+  const bookingPayload = body.booking || body.ticket || body.data || body;
+  if (
+    !bookingPayload
+    || typeof bookingPayload !== "object"
+    || Array.isArray(bookingPayload)
+    || Object.keys(bookingPayload).length === 0
+  ) {
+    console.error("Booking payload missing", {
+      contentType: req.headers["content-type"],
+      bodyKeys: Object.keys(body),
+    });
+    const error = new Error("Booking payload is required");
+    error.status = 400;
+    throw error;
+  }
+  await connectMongo();
+  const requestedSeats = Array.isArray(bookingPayload.allocatedSeats)
+    ? bookingPayload.allocatedSeats
+      .map((seat) => Number(seat.berthNumber))
+      .filter(Number.isInteger)
+    : [];
+  if (
+    bookingPayload.trainNumber
+    && bookingPayload.journeyDate
+    && bookingPayload.coach
+    && requestedSeats.length > 0
+  ) {
+    const conflictingBooking = await Booking.findOne({
+      status: { $ne: "Refund Processed" },
+      "booking.trainNumber": String(bookingPayload.trainNumber),
+      "booking.journeyDate": String(bookingPayload.journeyDate),
+      "booking.coach": String(bookingPayload.coach),
+      "booking.allocatedSeats.berthNumber": { $in: requestedSeats },
+    }).select("_id booking.allocatedSeats").lean();
+
+    if (conflictingBooking) {
+      const error = new Error("One or more selected berths are already booked for this train and date");
+      error.status = 409;
+      throw error;
+    }
+  }
+
+  const booking = await Booking.create({
+    ownerId: req.user._id,
+    booking: bookingPayload,
+    status: req.body.status || "Confirmed",
+  });
+  res.status(201).json({ success: true, booking });
+}));
+
+app.patch("/api/bookings/:id/cancel", authenticate, route(async (req, res) => {
+  await connectMongo();
+  if (!mongoose.isValidObjectId(req.params.id)) {
+    const error = new Error("Invalid booking id");
+    error.status = 400;
+    throw error;
+  }
+  const booking = await Booking.findOneAndUpdate(
+    { _id: req.params.id, ownerId: req.user._id },
+    { $set: { status: "Refund Processed", "booking.status": "Cancelled", "booking.refundInfo": req.body.refundInfo || null } },
+    { new: true }
+  ).lean();
+  if (!booking) {
+    const error = new Error("Booking not found");
+    error.status = 404;
+    throw error;
+  }
+  res.json({ success: true, booking });
+}));
 
 // ==========================================
 // 6. RAILWAY API HEALTH
@@ -482,7 +824,10 @@ app.get(
   route(async (req, res) => {
     const number = trainNumber(req.params.trainNo);
     const boardingDate = dateValue(req.query.date);
-    const cacheKey = `${number}:${boardingDate}:${req.query.from || ""}`;
+    const requestedRunDate = req.query.runDate
+      ? dateValue(req.query.runDate)
+      : "";
+    const cacheKey = `${number}:${requestedRunDate || boardingDate}:${req.query.from || ""}`;
     const cached = liveStatusCache.get(cacheKey);
 
     const forceRefresh = req.query.refresh === "1";
@@ -490,9 +835,9 @@ app.get(
       return res.json(cached.payload);
     }
 
-    let runDate = boardingDate;
+    let runDate = requestedRunDate || boardingDate;
 
-    if (req.query.from) {
+    if (req.query.from && !requestedRunDate) {
       const boardingStation = stationCode(req.query.from);
       const schedule = await railwayAPI(`/api/v1/trains/${number}`);
       const scheduleData = schedule.data || schedule;
